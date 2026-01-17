@@ -28,6 +28,8 @@ import random
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from controller.api import IAgentController
+
 # Planner hyper-parameters
 PARTICLE_COUNT = 150
 HORIZON = 5
@@ -60,7 +62,17 @@ def _get_field(obj: Any, keys: List[str], default=None):
 
 
 def _to_numeric_status(my_tank_status: Any) -> Dict[str, Any]:
-    """Normalize tank status (dict or object) to a simple dict with numeric fields."""
+    """Normalize tank status (dict or object) to a simple dict with numeric fields.
+
+    Extended to analyze the tank's ammo inventory (get_base_ammo / ammo slots)
+    and expose a normalized `ammo_details` map with fields:
+      { AMMO_NAME: { 'count': int, 'damage': float, 'range': float, 'reload_time': float } }
+    plus convenience fields: `ammo_total`, `primary_ammo` (name), `preferred_ammo_by_damage`.
+
+    The method is defensive: it will attempt to import the engine's AmmoType enum to
+    read canonical damage/range/reload values, but will still work if that import fails
+    (falling back to best-effort extraction from provided dicts/objects).
+    """
     s = {}
     s["id"] = _get_field(my_tank_status, ["_id", "id"], "agent")
     s["team"] = _get_field(my_tank_status, ["_team", "team"], 0)
@@ -84,15 +96,150 @@ def _to_numeric_status(my_tank_status: Any) -> Dict[str, Any]:
     s["_heading_spin_rate"] = _get_field(my_tank_status, ["_heading_spin_rate"], DEFAULT_HEADING_SPIN_RATE)
     s["_barrel_spin_rate"] = _get_field(my_tank_status, ["_barrel_spin_rate"], DEFAULT_BARREL_SPIN_RATE)
 
-    # ammo counts map (optional)
-    ammo = _get_field(my_tank_status, ["ammo"], {})
-    if isinstance(ammo, dict):
+    # -----------------
+    # Ammo analysis
+    # -----------------
+    ammo_obj = _get_field(my_tank_status, ["ammo"], {}) or {}
+
+    # Try to import canonical AmmoType for property lookup
+    AmmoTypeEnum = None
+    try:
+        from backend.structures.ammo import AmmoType as AmmoTypeEnum  # type: ignore
+    except Exception:
+        AmmoTypeEnum = None
+
+    ammo_details: Dict[str, Dict[str, Any]] = {}
+    ammo_counts: Dict[str, int] = {}
+
+    # ammo_obj keys might be AmmoType enum members, strings, or other identifiers
+    for k, v in (ammo_obj.items() if isinstance(ammo_obj, dict) else []):
+        # derive ammo name
+        ammo_name = None
         try:
-            s["ammo_counts"] = {k: (v.get("count") if isinstance(v, dict) else getattr(v, "count", None)) for k, v in ammo.items()}
+            # if enum instance
+            if AmmoTypeEnum is not None and isinstance(k, AmmoTypeEnum):
+                ammo_name = k.name
+            elif isinstance(k, str):
+                ammo_name = k
+            else:
+                # fallback to string conversion
+                ammo_name = str(k)
         except Exception:
-            s["ammo_counts"] = {}
-    else:
-        s["ammo_counts"] = {}
+            ammo_name = str(k)
+
+        # extract count from slot (dict-like or object)
+        count = None
+        if isinstance(v, dict):
+            count = v.get("count")
+        else:
+            try:
+                count = getattr(v, "count", None)
+            except Exception:
+                count = None
+
+        if count is None:
+            try:
+                count = int(v)
+            except Exception:
+                count = 0
+
+        ammo_counts[ammo_name] = int(count or 0)
+
+        # try to get canonical ammo properties from AmmoTypeEnum
+        damage = None
+        rng = None
+        reload_t = None
+        if AmmoTypeEnum is not None:
+            try:
+                # attempt to lookup by name (keys in engine are e.g. AmmoType.HEAVY)
+                if ammo_name in AmmoTypeEnum.__members__:
+                    at = AmmoTypeEnum[ammo_name]
+                    # AmmoType.value_amount returns negative values in engine enum
+                    damage = abs(at.value_amount)
+                    rng = float(at.range)
+                    reload_t = float(at.reload_time)
+            except Exception:
+                damage = None
+                rng = None
+                reload_t = None
+
+        # fallback: if ammo slot object contains info, try to read
+        if damage is None:
+            # some AmmoSlot may not hold damage but we can still guess from name
+            damage = None
+        if rng is None:
+            rng = None
+        if reload_t is None:
+            reload_t = None
+
+        ammo_details[ammo_name] = {
+            "count": int(count or 0),
+            "damage": damage,
+            "range": rng,
+            "reload_time": reload_t,
+        }
+
+    # Also include base ammo (get_base_ammo) if available on the object
+    try:
+        base_ammo_map = None
+        if hasattr(my_tank_status, "get_base_ammo") and callable(getattr(my_tank_status, "get_base_ammo")):
+            try:
+                base_ammo_map = my_tank_status.get_base_ammo()
+            except Exception:
+                base_ammo_map = None
+
+        if base_ammo_map and isinstance(base_ammo_map, dict):
+            for k, slot in base_ammo_map.items():
+                # extract ammo name
+                name = None
+                try:
+                    if AmmoTypeEnum is not None and isinstance(k, AmmoTypeEnum):
+                        name = k.name
+                    else:
+                        name = str(k)
+                except Exception:
+                    name = str(k)
+
+                # count on base_ammo is slot.count
+                try:
+                    base_count = int(getattr(slot, "count", None) or (slot.get("count") if isinstance(slot, dict) else 0))
+                except Exception:
+                    base_count = 0
+
+                # if we already have details from ammo_obj, don't overwrite counts but fill missing props
+                if name not in ammo_details:
+                    ammo_details[name] = {"count": base_count, "damage": None, "range": None, "reload_time": None}
+                    ammo_counts[name] = int(base_count)
+
+                # fill properties from AmmoTypeEnum if possible
+                if AmmoTypeEnum is not None:
+                    try:
+                        if name in AmmoTypeEnum.__members__:
+                            at = AmmoTypeEnum[name]
+                            ammo_details[name]["damage"] = abs(at.value_amount)
+                            ammo_details[name]["range"] = float(at.range)
+                            ammo_details[name]["reload_time"] = float(at.reload_time)
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    # summary fields
+    total_ammo = sum(ammo_counts.values()) if ammo_counts else 0
+    # choose preferred ammo by damage among available types with count>0
+    preferred_by_damage = None
+    best_damage = -1.0
+    for name, info in ammo_details.items():
+        cnt = info.get("count", 0) or 0
+        dmg = info.get("damage") if info.get("damage") is not None else -1
+        if cnt > 0 and dmg is not None and dmg > best_damage:
+            best_damage = dmg
+            preferred_by_damage = name
+
+    s["ammo_counts"] = ammo_counts
+    s["ammo_details"] = ammo_details
+    s["ammo_total"] = int(total_ammo)
+    s["preferred_ammo_by_damage"] = preferred_by_damage
 
     return s
 
@@ -291,15 +438,17 @@ def _astar_path(start: Tuple[float, float], goal: Tuple[float, float], obstacles
     def heuristic(a, b):
         return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
-    open_set = [(0 + heuristic(start_cell, goal_cell), 0, start_cell, None)]  # (f, g, cell, parent)
+    open_set = [(0 + heuristic(start_cell, goal_cell), 0, start_cell)]  # (f, g, cell)
     came_from = {}
+    parent_map = {}
     gscore = {start_cell: 0}
 
     while open_set:
-        f, g, cell, parent = heapq.heappop(open_set)
+        f, g, cell = heapq.heappop(open_set)
         if cell in came_from:
             continue
-        came_from[cell] = parent
+        # record visited parent
+        came_from[cell] = parent_map.get(cell, None)
         if cell == goal_cell:
             break
         cx, cy = cell
@@ -314,7 +463,8 @@ def _astar_path(start: Tuple[float, float], goal: Tuple[float, float], obstacles
             if ncell in gscore and ng >= gscore[ncell]:
                 continue
             gscore[ncell] = ng
-            heapq.heappush(open_set, (ng + heuristic(ncell, goal_cell), ng, ncell, cell))
+            parent_map[ncell] = cell
+            heapq.heappush(open_set, (ng + heuristic(ncell, goal_cell), ng, ncell))
 
     # Reconstruct path
     if goal_cell not in came_from:
@@ -327,6 +477,18 @@ def _astar_path(start: Tuple[float, float], goal: Tuple[float, float], obstacles
     path.reverse()
     return path
 
+
+# Helper to canonicalize arbitrary action-like sequences
+def _action_to_tuple(act) -> Tuple[float, float, float, bool]:
+    """Canonicalize an action-like sequence element to a (barrel, heading, move, fire) tuple."""
+    try:
+        b = float(act[0])
+        h = float(act[1])
+        m = float(act[2])
+        f = bool(act[3])
+        return (b, h, m, f)
+    except Exception:
+        return (0.0, 0.0, 0.0, False)
 
 # -----------------------------
 # PSO optimizer for aim / short-term pose
@@ -363,7 +525,7 @@ def _pso_optimize_aim(start_status: Dict[str, Any], target: Optional[Dict[str, A
         act = rand_action()
         particles.append(act)
         pbest.append(act[:])
-        score, _ = _simulate_sequence(start_status, target, [tuple(act)], horizon=1)
+        score, _ = _simulate_sequence(start_status, target, [_action_to_tuple(act)], horizon=1)
         pbest_score.append(score)
         if score > gbest_score:
             gbest_score = score
@@ -395,7 +557,7 @@ def _pso_optimize_aim(start_status: Dict[str, Any], target: Optional[Dict[str, A
             # toggle firing probabilistically if good alignment
             particles[i][3] = random.random() < 0.2 or particles[i][3]
 
-            score, _ = _simulate_sequence(start_status, target, [tuple(particles[i])], horizon=1)
+            score, _ = _simulate_sequence(start_status, target, [_action_to_tuple(particles[i])], horizon=1)
             if score > pbest_score[i]:
                 pbest_score[i] = score
                 pbest[i] = particles[i][:]
@@ -643,13 +805,13 @@ def destroy():
     return None
 
 
-def end(final_score: Dict[str, Any]):
+def end(final_score: Any):
     # Agent receives final scoreboard - can be used for learning/logging
     return None
 
 
 # make an "agent_controller" object similar to older agents that expose functions
-class _AgentControllerProxy:
+class _AgentControllerProxy(IAgentController):
     def get_action(self, current_tick, my_tank_status, sensor_data, enemies_remaining):
         return get_action(current_tick, my_tank_status, sensor_data, enemies_remaining)
 
@@ -661,3 +823,4 @@ class _AgentControllerProxy:
 
 
 agent_controller = _AgentControllerProxy()
+
